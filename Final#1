@@ -1,0 +1,257 @@
+import discord
+import sqlite3
+from discord.ext import commands, tasks
+import json
+import string
+import asyncio
+import requests
+
+intents = discord.Intents.all()
+intents.members = True
+intents.messages = True  # включаем интенты для получения сообщений на сервере
+
+bot = commands.Bot(command_prefix='~', intents=intents)
+
+@bot.event
+async def on_ready():
+    print(f'Logged in as {bot.user}')
+
+    global base, cur
+    base = sqlite3.connect('db_bot.db')
+    cur = base.cursor()
+    if base:
+        print('db connected')
+
+@bot.event
+async def on_message(message):
+    global base, cur
+    if {i.lower().translate(str.maketrans('', '', string.punctuation)) for i in message.content.split(' ')}\
+    .intersection(set(json.load(open('cens.json')))) != set():
+        await message.channel.send(f'{message.author.mention},  у нас запрещено использовать такие слова')
+        await message.delete()
+
+        name = message.guild.name
+
+        base.execute('CREATE TABLE IF NOT EXISTS {}(userid INT, count INT)'.format(name))
+        base.commit()
+
+        war = cur.execute('SELECT * FROM {} WHERE userid == ?'.format(name), (message.author.id,)).fetchone()
+
+        if war == None:
+            cur.execute('INSERT INTO {} VALUES(?, ?)'.format(name), (message.author.id, 1))
+            base.commit()
+            await message.channel.send(f'{message.author.mention}, вам выданно 1-е предупреждение ещё 2 и БАН')
+        elif war[1] == 1:
+            cur.execute('UPDATE {} SET count == ? WHERE userid == ?'.format(name), (2, message.author.id))
+            base.commit()
+            await message.channel.send(f'{message.author.mention}, вам выданно 2-е предупреждение ещё 1 и БАН')
+        elif war[1] == 2:
+            cur.execute('UPDATE {} SET count == ? WHERE userid == ?'.format(name), (3, message.author.id))
+            base.commit()
+            await message.channel.send(f'{message.author.mention}, вам выданно 3-е предупреждение, вам положен БАН')
+            await message.author.ban(reason='Нецерзурная брань')
+    print(f'Бот получил сообщение "{message.content}" ')
+    await bot.process_commands(message)
+
+@bot.event
+async def on_member_remove(member):
+    await member.send('подлая редиска, я тебя зарежу')
+
+    for zxc in bot.get_guild(member.guild.id).channels:
+        if zxc.name == 'основной':
+            await bot.get_channel(zxc.id).send(f'{member} , подло дизертировал')
+
+@bot.event
+async def on_member_join(member):
+    await member.send('Приветствую жалкий гоблин')
+    for zxc in bot.get_guild(member.guild.id).channels:
+        if zxc.name == 'основной':
+            await bot.get_channel(zxc.id).send(f'{member} , приветствуем в нашем сброде')
+
+@bot.command()
+async def warning(ctx):
+    base.execute('CREATE TABLE IF NOT EXISTS {}(userid INT, count INT)'.format(ctx.message.guild.name))
+    base.commit()
+    war = cur.execute('SELECT * FROM {} WHERE userid == ?'.format(ctx.message.guild.name), (ctx.message.\
+                                                                                            author.id,)).fetchone()
+    if war:
+        await ctx.send(f'{ctx.message.author.mention}, вот ваше кол-во грехов {war[1]}')
+    else:
+        await ctx.send(f'{ctx.message.author.mention}, у вас пока нет грехов')
+
+@bot.command()
+async def unban(ctx, *, member):
+    banned_users = await ctx.guild.bans()
+    mem_name, mem_disc = member.split('#')
+
+    for ban_entry in banned_users:
+        user = ban_entry.user
+
+        if (user.name, user.discriminator) == (mem_name, mem_disc):
+            await ctx.guild.unban(user)
+            await ctx.send(f'{user.mention} был разбанен.')
+            cur.execute('UPDATE {} SET count == ? WHERE userid == ?'.format(ctx.message.guild.name), (0,ctx.message.author.id))
+            base.commit()
+            return
+
+@bot.command()
+async def info(ctx, arg=None):
+    author = ctx.message.author
+    if arg == None:
+        await ctx.send(f'{author.mention} Введите\n ~info command\n ~info soc\n ~info rules')
+    elif arg == 'soc':
+        await ctx.send(f'{author.mention} Привет я Punpun, я являюсь ботом-модератором для серверов.\n Для управление '
+                       f'мною, на сервере должны быть роли moder и admin\n Для ознакомления'
+                       f' с правилами сервера введи команду ~info rules')
+    elif arg == 'rules':
+            await ctx.send(f'{author.mention} Правила сервера:\n 1. Запрещено оскорблять и '
+                           f'использовать нецензурную лексику\n 2. Запрещено спамить\n 3. За каждое нарушение '
+                           f'пользователь получает выговор, после 3 выговоров пользователя банят на сервере\n'
+                           f'4. За не уважение к администрации пользователю дается mute')
+    elif arg == 'command':
+        await ctx.send(f'{author.mention} Команды для всех:\n '
+                       f'~stats - показывает кол-во пользователей онлайн, оффлайн, неактивных, небеспокоить и кол-во '
+                       f'пользователей на сервере\n'
+                       f'~stats_more - оказывает кол-во пользователей онлайн, оффлайн, неактивных, небеспокоить, '
+                       f'кол-во пользователей на сервере и ники этих пользователей\n'
+                       f'Команды для модераторов:\n ~mute @user кол-во минут- забирает все роли у пользователя и '
+                       f'выдает роль MUTE, пользователь не сможет говорить'
+                       f'и писать в чат\n'
+                       f'~clear кол-во сообщений - отчистка определенного кол-во сообщений, '
+                       f'число сообщений надо писать через пробел\n '
+                       f' ~unvoice - выключает микрофоны '
+                       f'всем в голосовом канале\n~voice - отменяет '
+                       f'действие команды unvoice')
+    else:
+        await ctx.send(f'{author.mention} Команда введена не верно!')
+
+@bot.command()
+async def stats_more(ctx):
+    members = ctx.guild.members
+    online = []
+    idle = []
+    dnd = []
+    offline = []
+    for member in members:
+        if member.status == discord.Status.online:
+            online.append(member)
+        elif member.status == discord.Status.idle:
+            idle.append(member)
+        elif member.status == discord.Status.dnd:
+            dnd.append(member)
+        else:
+            offline.append(member)
+    message = f'**Online ({len(online)}):**\n'
+    for member in online:
+        message += f'{member.name}\n'
+    message += f'\n**Not active ({len(idle)}):**\n'
+    for member in idle:
+        message += f'{member.name}\n'
+    message += f'\n**Do not worry ({len(dnd)}):**\n'
+    for member in dnd:
+        message += f'{member.name}\n'
+    message += f'\n**Offline ({len(offline)}):**\n'
+    message += f'Total: {len(offline + online + idle + dnd)}\n'
+    await ctx.send(message)
+
+@bot.command()
+async def stats(ctx):
+    members = ctx.guild.members
+    online = []
+    idle = []
+    dnd = []
+    offline = []
+    for member in members:
+        if member.status == discord.Status.online:
+            online.append(member)
+        elif member.status == discord.Status.idle:
+            idle.append(member)
+        elif member.status == discord.Status.dnd:
+            dnd.append(member)
+        else:
+            offline.append(member)
+    message = f'Online: {len(online)}\n'
+    message += f'Not active: {len(idle)}\n'
+    message += f'Do not worry: {len(dnd)}\n'
+    message += f'Offline: {len(offline)}\n'
+    message += f'Total: {len(offline + online + idle + dnd)}\n'
+    await ctx.send(message)
+
+@bot.command()
+@commands.has_any_role('moder', 'admin')
+async def clear(ctx, amount: int = None):
+    if amount is None:
+        await ctx.send('Пожалуйста, укажите количество сообщений, которые нужно удалить.')
+    elif amount > 100:
+        await ctx.send('Вы не можете удалить более 100 сообщений за один раз.')
+    else:
+        await ctx.channel.purge(limit=amount)
+        await ctx.send(f'Удалено {amount} сообщений.')
+        print(f'Бот удалил {amount} сообщений в канале {ctx.message.channel}')
+
+@clear.error
+async def clear_error(ctx, error):
+    if isinstance(error, commands.CheckFailure):
+        await ctx.send("У мужлан нет прав")
+
+@bot.command()
+@commands.has_any_role('moder', 'admin')
+async def unvoice(ctx):
+    if ctx.author.voice:
+        channel = ctx.author.voice.channel
+        for member in channel.members:
+            await member.edit(mute=True)
+        await ctx.send('Тихий час настал')
+    else:
+        await ctx.send('Сначало надо подключиться к каналу')
+
+@unvoice.error
+async def unvoice_error(ctx, error):
+    if isinstance(error, commands.CheckFailure):
+        await ctx.send("У мужлан нет прав")
+
+@bot.command()
+@commands.has_any_role('moder', 'admin')
+async def voice(ctx):
+    if ctx.author.voice:
+        channel = ctx.author.voice.channel
+        for member in channel.members:
+            await member.edit(mute=False)
+        await ctx.send('Тихий час кончился')
+    else:
+        await ctx.send('Сначало надо подключиться к каналу')
+
+@voice.error
+async def unvoice_error(ctx, error):
+    if isinstance(error, commands.CheckFailure):
+        await ctx.send("У мужлан нет прав")
+
+
+@bot.command()
+async def mute(ctx, member: discord.Member, duration: int):
+    if ctx.author.guild_permissions.manage_roles:
+        original_roles = member.roles
+        await member.edit(roles=[])
+        timeout_role = discord.utils.get(ctx.guild.roles, name='MUTE')
+        await member.add_roles(timeout_role)
+        await ctx.send(f'{member.mention} наказан на {duration} минут.')
+        await asyncio.sleep(duration)
+        await member.remove_roles(timeout_role)
+        await member.edit(roles=original_roles)
+        await ctx.send(f'{member.mention} ты снова можешь заниматься фигнёй.')
+    else:
+        await ctx.send('Вы безправное создание')
+
+@mute.error
+async def timeout_error(ctx, error):
+    if isinstance(error, commands.BadArgument):
+        await ctx.send('Неверный формат команды. Правильный формат: `!mute @пользователь время_в_секундах`')
+    else:
+        raise error
+
+@bot.command(name='picture')
+async def get_picture(ctx, *, query: str):
+    response = requests.get(f'https://source.unsplash.com/featured/?{query}')
+    await ctx.send(response.url)
+
+bot.run('MTA5NjQxMzM5MzUyNDYzMzcwMA.GQ2DzG.c03k2AyqT5KaN9BGnL7JfmizyPuaAgax2Cylq8')
