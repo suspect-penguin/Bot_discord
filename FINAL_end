@@ -1,0 +1,438 @@
+import discord
+import sqlite3
+from discord.ext import commands, tasks
+import json
+import string
+import asyncio
+import requests
+from datetime import datetime, timedelta
+
+intents = discord.Intents.all()
+intents.members = True
+intents.messages = True
+
+bot = commands.Bot(command_prefix='~', intents=intents)
+duplicating_users = []
+events = {}
+scheduled_events = []
+server_rules = []
+
+conn = sqlite3.connect('server_rules.db')
+cursor = conn.cursor()
+
+cursor.execute('''CREATE TABLE IF NOT EXISTS server_rules
+                  (server_id INTEGER PRIMARY KEY, rules TEXT)''')
+conn.commit()
+
+def remove_event(guild_id, event_name):
+    if guild_id in events:
+        for event in events[guild_id]:
+            if event[0] == event_name:
+                events[guild_id].remove(event)
+                return True
+    return False
+
+def add_event(guild_id, event_name, event_time):
+    if guild_id not in events:
+        events[guild_id] = []
+    events[guild_id].append((event_name, event_time))
+
+# функция для получения списка событий
+def get_schedule(guild_id):
+    if guild_id not in events:
+        return "Нет запланированных событий."
+    else:
+        schedule = ''
+        for event in events[guild_id]:
+            schedule += f"{event[0]} - {event[1].strftime('%d.%m.%Y %H:%M')}\n"
+        return schedule
+
+# функция для проверки событий и отправки уведомлений
+async def check_events(ctx):
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        for guild_id in events:
+            for event in events[guild_id]:
+                if event[1] <= datetime.now():
+                    guild = bot.get_guild(guild_id)
+                    if guild:
+                        channel = guild.system_channel
+                        if channel:
+                            await channel.send(f"{ctx.author.mention}, напоминание: {event[0]}")
+                    events[guild_id].remove(event)
+        await asyncio.sleep(10)
+
+@bot.event
+async def on_ready():
+    print(f'Logged in as {bot.user}')
+
+    global base, cur
+    base = sqlite3.connect('db_bot.db')
+    cur = base.cursor()
+    if base:
+        print('db connected')
+    bot.loop.create_task(check_events())
+
+@bot.event
+async def on_message(message):
+    global base, cur
+    if {i.lower().translate(str.maketrans('', '', string.punctuation)) for i in message.content.split(' ')}\
+    .intersection(set(json.load(open('cens.json')))) != set():
+        await message.channel.send(f'{message.author.mention},  у нас запрещено использовать такие слова')
+        await message.delete()
+
+        name = message.guild.name
+
+        base.execute('CREATE TABLE IF NOT EXISTS {}(userid INT, count INT)'.format(name))
+        base.commit()
+
+        war = cur.execute('SELECT * FROM {} WHERE userid == ?'.format(name), (message.author.id,)).fetchone()
+
+        if war == None:
+            cur.execute('INSERT INTO {} VALUES(?, ?)'.format(name), (message.author.id, 1))
+            base.commit()
+            await message.channel.send(f'{message.author.mention}, вам выданно 1-е предупреждение ещё 2 и БАН')
+        elif war[1] == 1:
+            cur.execute('UPDATE {} SET count == ? WHERE userid == ?'.format(name), (2, message.author.id))
+            base.commit()
+            await message.channel.send(f'{message.author.mention}, вам выданно 2-е предупреждение ещё 1 и БАН')
+        elif war[1] == 2:
+            cur.execute('UPDATE {} SET count == ? WHERE userid == ?'.format(name), (3, message.author.id))
+            base.commit()
+            await message.channel.send(f'{message.author.mention}, вам выданно 3-е предупреждение, вам положен БАН')
+            await message.author.ban(reason='Нецерзурная брань')
+
+    if message.author == bot.user:
+        return
+
+    if message.author.id in duplicating_users:
+        await message.channel.send(message.content)
+
+    print(f'Бот получил сообщение "{message.content}" ')
+    await bot.process_commands(message)
+
+@bot.event
+async def on_member_remove(member):
+    await member.send('подлая редиска, я тебя зарежу')
+
+    for zxc in bot.get_guild(member.guild.id).channels:
+        if zxc.name == 'system':
+            await bot.get_channel(zxc.id).send(f'{member} , подло дизертировал')
+
+@bot.event
+async def on_member_join(member):
+    # Приветствуем  пользователя в лс
+    await member.send(
+        f"Приветствую жалкий гоблин, {member.name}! Напиши свой пол мужской или женский.")
+
+    # Приветствуем нового пользователя на сервере
+    channel = discord.utils.get(member.guild.channels, name="основной")
+    await channel.send(f"Добро пожаловать на сервер, {member.mention}!")
+
+    def check(m):
+        return m.author == member and m.channel == member.dm_channel
+
+    msg = await bot.wait_for('message', check=check)
+    gender = msg.content.lower()
+    if gender == "мужской":
+        role = discord.utils.get(member.guild.roles, name="работяга")
+    elif gender == "женский":
+        role = discord.utils.get(member.guild.roles, name="леди")
+    else:
+        role = None
+    if role is not None:
+        await member.add_roles(role)
+        await member.send(f"Вы получили роль {role.name} на нашем сервере!")
+    else:
+        await member.send("К сожалению, я не могу найти подходящую для вас роль на сервере.")
+
+# команда для добавления события
+@bot.command(name='event')
+@commands.has_any_role('moder', 'admin')
+async def add_event_command(ctx, event_name: str, event_time: str):
+    try:
+        event_time = datetime.strptime(event_time, '%d.%m.%Y-%H:%M')
+    except ValueError:
+        await ctx.send('Неверный формат времени. Используйте "дд.мм.гггг-чч:мм".')
+        return
+    # добавляем событие в список
+    add_event(ctx.guild.id, event_name, event_time)
+    await ctx.send(f'Событие "{event_name}" добавлено на {event_time.strftime("%d.%m.%Y %H:%M")}.')
+
+@add_event_command.error
+async def add_event_command_error(ctx, error):
+    if isinstance(error, commands.CheckFailure):
+        await ctx.send("У мужлан нет прав")
+
+@bot.command(name='del_event')
+@commands.has_any_role('moder', 'admin')
+async def remove_event_command(ctx, event_name: str):
+    # удаляем событие из списка
+    if remove_event(ctx.guild.id, event_name):
+        await ctx.send(f'Событие "{event_name}" удалено.')
+    else:
+        await ctx.send(f'Событие "{event_name}" не найдено.')
+
+@remove_event_command.error
+async def remove_event_command(ctx, error):
+    if isinstance(error, commands.CheckFailure):
+        await ctx.send("У мужлан нет прав")
+
+# команда для получения списка событий
+@bot.command(name='schedule')
+async def get_schedule_command(ctx):
+    # получаем список событий для сервера автора сообщения
+    schedule = get_schedule(ctx.guild.id)
+    await ctx.send(schedule)
+
+# Команда для повторения за пользователем
+@bot.command()
+async def rep(ctx):
+    duplicating_users.append(ctx.author.id)
+    await ctx.send(f"Режим дублирования сообщений включен для {ctx.author.mention}")
+
+# Команда для выключения повторения за пользователем
+@bot.command()
+async def stop(ctx):
+    if ctx.author.id in duplicating_users:
+        duplicating_users.remove(ctx.author.id)
+        await ctx.send(f"Режим дублирования сообщений выключен для {ctx.author.mention}")
+    else:
+        await ctx.send(f"{ctx.author.mention}, вы не были включены в список дублируемых пользователей")
+
+# Команда для получения случайной шутки
+@bot.command()
+async def joke(ctx):
+    response = requests.get('https://official-joke-api.appspot.com/random_joke')
+    joke = response.json()
+    await ctx.send(joke['setup'])
+    await ctx.send(joke['punchline'])
+
+#кол-во грехов
+@bot.command()
+async def warning(ctx):
+    base.execute('CREATE TABLE IF NOT EXISTS {}(userid INT, count INT)'.format(ctx.message.guild.name))
+    base.commit()
+    war = cur.execute('SELECT * FROM {} WHERE userid == ?'.format(ctx.message.guild.name), (ctx.message.\
+                                                                                            author.id,)).fetchone()
+    if war:
+        await ctx.send(f'{ctx.message.author.mention}, вот ваше кол-во грехов {war[1]}')
+    else:
+        await ctx.send(f'{ctx.message.author.mention}, у вас пока нет грехов')
+
+# Команда для добавления правил сервера
+@bot.command(name='rules')
+@commands.has_any_role('moder', 'admin')
+async def rules(ctx, *args):
+    server_id = ctx.guild.id
+    text = ' '.join(args)
+    cursor.execute("SELECT rules FROM server_rules WHERE server_id=?", (server_id,))
+    result = cursor.fetchone()
+
+    if result:
+        cursor.execute("UPDATE server_rules SET rules=? WHERE server_id=?", (text, server_id))
+    else:
+        cursor.execute("INSERT INTO server_rules (server_id, rules) VALUES (?, ?)", (server_id, text))
+    conn.commit()
+
+    await ctx.send("Правила сервера успешно добавлены.")
+
+@rules.error
+async def rules_error(ctx, error):
+    if isinstance(error, commands.CheckFailure):
+        await ctx.send("У мужлан нет прав")
+
+# Команда для удаления правил сервера
+@bot.command(name='del_rules')
+@commands.has_any_role('moder', 'admin')
+async def delete_rules(ctx):
+    server_id = ctx.guild.id
+    cursor.execute("DELETE FROM server_rules WHERE server_id=?", (server_id,))
+    conn.commit()
+
+    await ctx.send("Правила сервера успешно удалены.")
+
+# Команда для того, чтобы узнать информацию на сервере
+@bot.command()
+async def info(ctx, arg=None):
+    author = ctx.message.author
+    server_id = ctx.guild.id
+    cursor.execute("SELECT rules FROM server_rules WHERE server_id=?", (server_id,))
+    result = cursor.fetchone()
+    if arg == None:
+        await ctx.send(f'{author.mention} Введите\n ~info command\n ~info about\n ~info rules')
+    elif arg == 'about':
+        await ctx.send(f'{author.mention} Привет я Punpun, я являюсь ботом-модератором для серверов.\n Для управление '
+                       f'мною, на сервере должны быть роли moder и admin\n Для верификации пользователей по полу '
+                       f'нужны роли "работяга" и "леди"\nВсе команды с 2 и более словами пишутся через нижнее'
+                       f' подчеркивание\n'
+                       f'Я приветствую всех новых пользователей в канале с названием "основной"')
+    elif arg == 'rules':
+        if arg == 'rules':
+            if result:
+                await ctx.send(result[0])
+            else:
+                await ctx.send("На сервере пока нет правил.")
+    elif arg == 'command':
+        await ctx.send(f'{author.mention} Команды для всех:\n'
+                       f'~stats - показывает кол-во пользователей онлайн, оффлайн, неактивных, небеспокоить и кол-во '
+                       f'пользователей на сервере\n'
+                       f'~stats_more - оказывает кол-во пользователей онлайн, оффлайн, неактивных, небеспокоить, '
+                       f'кол-во пользователей на сервере и ники этих пользователей\n~warning - показывает '
+                       f'кол-во предупреждений\n~picture - присылает в чат случайное фото\n~rep - бот начинает '
+                       f'повторять сообщение за пользователем\n~stop - останавливает действие команды rep\n~joke -'
+                       f'присылает в чат случайную шутку\n~schedule - показывает все запланированные события\n'
+                       f'Команды для модераторов:\n~mute @user кол-во минут- забирает все роли у пользователя и '
+                       f'выдает роль MUTE, пользователь не сможет говорить и писать в чат\n'
+                       f'~clear кол-во сообщений - отчистка определенного кол-во сообщений\n'
+                       f'~unvoice - выключает микрофоны всем в голосовом канале\n~voice - отменяет '
+                       f'действие команды unvoice\n~event - с помощью этой команды можно запланировать событие на '
+                       f'определенную дату и время (~event название_события 23.04.2023-04:15)\n~del_event '
+                       f'название_события - удаляет событие\n~rules все_правила - добавляет правила для сервера'
+                       f'(повторное использование команды удаляет предыдущий текст)\n~del_rules - удаляет правила')
+    else:
+        await ctx.send(f'{author.mention} Команда введена не верно!')
+
+#статистика сервера на момент вр.
+@bot.command()
+async def stats_more(ctx):
+    members = ctx.guild.members
+    online = []
+    idle = []
+    dnd = []
+    offline = []
+    for member in members:
+        if member.status == discord.Status.online:
+            online.append(member)
+        elif member.status == discord.Status.idle:
+            idle.append(member)
+        elif member.status == discord.Status.dnd:
+            dnd.append(member)
+        else:
+            offline.append(member)
+    message = f'**Online ({len(online)}):**\n'
+    for member in online:
+        message += f'{member.name}\n'
+    message += f'\n**Not active ({len(idle)}):**\n'
+    for member in idle:
+        message += f'{member.name}\n'
+    message += f'\n**Do not worry ({len(dnd)}):**\n'
+    for member in dnd:
+        message += f'{member.name}\n'
+    message += f'\n**Offline ({len(offline)}):**\n'
+    message += f'Total: {len(offline + online + idle + dnd)}\n'
+    await ctx.send(message)
+
+@bot.command()
+async def stats(ctx):
+    members = ctx.guild.members
+    online = []
+    idle = []
+    dnd = []
+    offline = []
+    for member in members:
+        if member.status == discord.Status.online:
+            online.append(member)
+        elif member.status == discord.Status.idle:
+            idle.append(member)
+        elif member.status == discord.Status.dnd:
+            dnd.append(member)
+        else:
+            offline.append(member)
+    message = f'Online: {len(online)}\n'
+    message += f'Not active: {len(idle)}\n'
+    message += f'Do not worry: {len(dnd)}\n'
+    message += f'Offline: {len(offline)}\n'
+    message += f'Total: {len(offline + online + idle + dnd)}\n'
+    await ctx.send(message)
+
+#отчистка чата
+@bot.command()
+@commands.has_any_role('moder', 'admin')
+async def clear(ctx, amount: int = None):
+    if amount is None:
+        await ctx.send('Пожалуйста, укажите количество сообщений, которые нужно удалить.')
+    elif amount > 100:
+        await ctx.send('Вы не можете удалить более 100 сообщений за один раз.')
+    else:
+        await ctx.channel.purge(limit=amount)
+        await ctx.send(f'Удалено {amount} сообщений.')
+        print(f'Бот удалил {amount} сообщений в канале {ctx.message.channel}')
+
+@clear.error
+async def clear_error(ctx, error):
+    if isinstance(error, commands.CheckFailure):
+        await ctx.send("У мужлан нет прав")
+
+#отключ/включ микро
+@bot.command()
+@commands.has_any_role('moder', 'admin')
+async def unvoice(ctx):
+    if ctx.author.voice:
+        channel = ctx.author.voice.channel
+        for member in channel.members:
+            await member.edit(mute=True)
+        await ctx.send('Тихий час настал')
+    else:
+        await ctx.send('Сначало надо подключиться к каналу')
+
+@unvoice.error
+async def unvoice_error(ctx, error):
+    if isinstance(error, commands.CheckFailure):
+        await ctx.send("У мужлан нет прав")
+
+@bot.command()
+@commands.has_any_role('moder', 'admin')
+async def voice(ctx):
+    if ctx.author.voice:
+        channel = ctx.author.voice.channel
+        for member in channel.members:
+            await member.edit(mute=False)
+        await ctx.send('Тихий час кончился')
+    else:
+        await ctx.send('Сначало надо подключиться к каналу')
+
+@voice.error
+async def voice_error(ctx, error):
+    if isinstance(error, commands.CheckFailure):
+        await ctx.send("У мужлан нет прав")
+
+#mute
+@bot.command()
+async def mute(ctx, member: discord.Member, duration: int):
+    if ctx.author.guild_permissions.manage_roles:
+        original_roles = member.roles
+        await member.edit(roles=[])
+        timeout_role = discord.utils.get(ctx.guild.roles, name='MUTE')
+        await member.add_roles(timeout_role)
+        await ctx.send(f'{member.mention} наказан на {duration} минут.')
+        await asyncio.sleep(duration)
+        await member.remove_roles(timeout_role)
+        await member.edit(roles=original_roles)
+        await ctx.send(f'{member.mention} ты снова можешь заниматься фигнёй.')
+    else:
+        await ctx.send('Вы безправное создание')
+
+@mute.error
+async def timeout_error(ctx, error):
+    if isinstance(error, commands.BadArgument):
+        await ctx.send('Неверный формат команды. Правильный формат: `!mute @пользователь время_в_секундах`')
+    else:
+        raise error
+
+# Команда для получения случайной картинки
+@bot.command(name='picture')
+async def get_picture(ctx):
+    url = 'https://picsum.photos/320/240'
+    response = requests.get(url)
+
+    if response.status_code == 200:
+        with open('picture.jpg', 'wb') as f:
+            f.write(response.content)
+        with open('picture.jpg', 'rb') as f:
+            picture = discord.File(f)
+            await ctx.send(file=picture)
+    else:
+        await ctx.send('Failed to retrieve image from Lorem Picsum.')
+
+bot.run('токен')
